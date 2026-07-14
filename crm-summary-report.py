@@ -249,8 +249,8 @@ st.markdown("""
 # ============================================================
 
 uploaded_file = st.file_uploader(
-    "Upload CRM Excel (.xlsx)",
-    type=["xlsx"],
+    "Upload CRM file (.xlsx or .csv)",
+    type=["xlsx", "csv"],
     help="Expects columns: Territory, Cluster, EmployeeName, City, LoginDate"
 )
 
@@ -266,16 +266,123 @@ if not uploaded_file:
     </div>
     """, unsafe_allow_html=True)
 
+
+# ============================================================
+# Helper: normalize LoginDate to IST, regardless of incoming format
+# ============================================================
+
+def normalize_to_ist(series: pd.Series) -> pd.Series:
+    """
+    Parses a LoginDate column that may arrive in mixed/inconsistent formats and
+    returns a clean, timezone-naive datetime series expressed in IST.
+
+    Rules:
+    - Tries day-first parsing (DD-MM-YYYY style) first, since that's the
+      expected default for this CRM export.
+    - Any values that fail to parse are retried without the day-first
+      assumption (covers stray MM-DD-YYYY / ISO / other rows).
+    - If a value carries explicit timezone info (e.g. 'Z', '+00:00', a UTC
+      offset), it is converted into IST.
+    - If a value is already timezone-naive, it is assumed to already
+      represent local/IST time and is left unchanged.
+    """
+
+    if series.empty:
+        return series
+
+    # First pass: day-first parsing
+    parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+    # Second pass: retry any still-unparsed (non-null original) values
+    # without the day-first assumption
+    mask = parsed.isna() & series.notna()
+    if mask.any():
+        retry = pd.to_datetime(series[mask], errors="coerce", dayfirst=False)
+        parsed.loc[mask] = retry
+
+    # If the whole column parsed as tz-aware (uniform tz across all rows),
+    # convert straight to IST and drop the tz label
+    if getattr(parsed.dt, "tz", None) is not None:
+        parsed = parsed.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        return parsed
+
+    # Otherwise, values may be a mix of naive and tz-aware datetimes
+    # (this can happen when the source column has mixed formats).
+    # Handle element-wise as a fallback.
+    def _fix(x):
+        if pd.isna(x):
+            return x
+        tzinfo = getattr(x, "tzinfo", None)
+        if tzinfo is not None:
+            return x.tz_convert("Asia/Kolkata").tz_localize(None)
+        return x
+
+    parsed = parsed.apply(_fix)
+    return parsed
+
+
 if uploaded_file:
 
-    # Read Excel from the uploaded file (not a hardcoded local path)
-    df = pd.read_excel(uploaded_file)
+    # ------------------------------------------------------------
+    # Read CSV or Excel, whichever was uploaded
+    # ------------------------------------------------------------
+    is_csv = uploaded_file.name.lower().endswith(".csv")
 
-    # Convert LoginDate
-    df["LoginDate"] = pd.to_datetime(
-        df["LoginDate"],
-        errors="coerce"
-    )
+    if is_csv:
+        # CRM/CSV exports vary a lot in encoding and delimiter, so try a
+        # sequence of reasonable combinations instead of assuming
+        # UTF-8 + comma. sep=None with engine="python" auto-detects the
+        # delimiter (comma, semicolon, tab, etc).
+        read_attempts = [
+            {"encoding": "utf-8-sig", "sep": None, "engine": "python"},
+            {"encoding": "utf-8", "sep": None, "engine": "python"},
+            {"encoding": "latin-1", "sep": None, "engine": "python"},
+            {"encoding": "cp1252", "sep": None, "engine": "python"},
+        ]
+
+        df = None
+        last_error = None
+
+        for attempt in read_attempts:
+            try:
+                uploaded_file.seek(0)  # reset pointer before each retry
+                df = pd.read_csv(uploaded_file, **attempt)
+                break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if df is None:
+            st.error(
+                "Couldn't read this CSV file. It may use an unusual encoding "
+                "or delimiter. Please re-export it as UTF-8 CSV, or upload "
+                "the original Excel (.xlsx) file instead."
+            )
+            st.exception(last_error)
+            st.stop()
+    else:
+        try:
+            df = pd.read_excel(uploaded_file)
+        except Exception as e:
+            st.error("Couldn't read this Excel file. Please check the file and try again.")
+            st.exception(e)
+            st.stop()
+
+    # Normalize column names (strips stray whitespace/BOM artifacts that
+    # sometimes survive in CSV headers)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    required_cols = {"Territory", "Cluster", "EmployeeName", "City", "LoginDate"}
+    missing_cols = required_cols - set(df.columns)
+    if missing_cols:
+        st.error(
+            f"This file is missing required column(s): {', '.join(sorted(missing_cols))}. "
+            f"Found columns: {', '.join(df.columns)}"
+        )
+        st.stop()
+
+    # Convert LoginDate (handles mixed formats, normalizes to IST)
+    df["LoginDate"] = normalize_to_ist(df["LoginDate"])
 
     # Remove blank dates
     df = df.dropna(subset=["LoginDate"])
