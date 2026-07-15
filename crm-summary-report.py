@@ -239,7 +239,8 @@ st.markdown("""
     <div class="hero-eyebrow">Territory &middot; Cluster &middot; Field Visits</div>
     <h1>🧭 Field Visit Compliance</h1>
     <p>Upload the daily CRM export to check first-half and second-half field time against
-    target, spot bunched check-ins, and export a formatted report for review.</p>
+    target, spot bunched check-ins, and export a formatted report for review. Optionally
+    upload the credit (TCM submission) report to add login counts per CM.</p>
     <div class="route-line"></div>
 </div>
 """, unsafe_allow_html=True)
@@ -248,11 +249,27 @@ st.markdown("""
 # Upload
 # ============================================================
 
-uploaded_file = st.file_uploader(
-    "Upload CRM file (.xlsx or .csv)",
-    type=["xlsx", "csv"],
-    help="Expects columns: Territory, Cluster, EmployeeName, City, LoginDate"
-)
+upload_col1, upload_col2 = st.columns(2)
+
+with upload_col1:
+    uploaded_file = st.file_uploader(
+        "Upload CRM file (.xlsx or .csv)",
+        type=["xlsx", "csv"],
+        help="Expects columns: Territory, Cluster, EmployeeName, City, LoginDate",
+        key="crm_uploader"
+    )
+
+with upload_col2:
+    credit_file = st.file_uploader(
+        "Upload Credit Report (.xlsx or .csv) — optional",
+        type=["xlsx", "csv"],
+        help=(
+            "Used to count logins. Looks for a 'Submitted to TCM Date Time' "
+            "column (falls back to Excel column AL) and a 'CL Name' column "
+            "(falls back to Excel column BE)."
+        ),
+        key="credit_uploader"
+    )
 
 if not uploaded_file:
     st.markdown("""
@@ -261,7 +278,8 @@ if not uploaded_file:
         <p style="color:var(--muted); margin:0;">
         Drop today's CRM export above to generate the compliance summary.
         Field-half (FH) visits before 2 PM need at least 2 hours in-field;
-        second-half (SH) visits need at least 3 hours.
+        second-half (SH) visits need at least 3 hours. The credit report is
+        optional — upload it too if you want login counts included.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -273,7 +291,7 @@ if not uploaded_file:
 
 def normalize_to_ist(series: pd.Series) -> pd.Series:
     """
-    Parses a LoginDate column that may arrive in mixed/inconsistent formats and
+    Parses a datetime column that may arrive in mixed/inconsistent formats and
     returns a clean, timezone-naive datetime series expressed in IST.
 
     Rules:
@@ -321,18 +339,19 @@ def normalize_to_ist(series: pd.Series) -> pd.Series:
     return parsed
 
 
-if uploaded_file:
+# ============================================================
+# Helper: read a CSV or Excel upload with encoding/delimiter fallbacks
+# ============================================================
 
-    # ------------------------------------------------------------
-    # Read CSV or Excel, whichever was uploaded
-    # ------------------------------------------------------------
-    is_csv = uploaded_file.name.lower().endswith(".csv")
+def read_uploaded_table(file, label):
+    """
+    Reads a CSV or Excel file-like upload into a DataFrame, trying a
+    sequence of encodings/delimiters for CSVs. Returns the DataFrame,
+    or (None, error) on failure.
+    """
+    is_csv = file.name.lower().endswith(".csv")
 
     if is_csv:
-        # CRM/CSV exports vary a lot in encoding and delimiter, so try a
-        # sequence of reasonable combinations instead of assuming
-        # UTF-8 + comma. sep=None with engine="python" auto-detects the
-        # delimiter (comma, semicolon, tab, etc).
         read_attempts = [
             {"encoding": "utf-8-sig", "sep": None, "engine": "python"},
             {"encoding": "utf-8", "sep": None, "engine": "python"},
@@ -340,33 +359,147 @@ if uploaded_file:
             {"encoding": "cp1252", "sep": None, "engine": "python"},
         ]
 
-        df = None
+        df_local = None
         last_error = None
 
         for attempt in read_attempts:
             try:
-                uploaded_file.seek(0)  # reset pointer before each retry
-                df = pd.read_csv(uploaded_file, **attempt)
+                file.seek(0)
+                df_local = pd.read_csv(file, **attempt)
                 break
             except Exception as e:
                 last_error = e
                 continue
 
-        if df is None:
+        if df_local is None:
             st.error(
-                "Couldn't read this CSV file. It may use an unusual encoding "
-                "or delimiter. Please re-export it as UTF-8 CSV, or upload "
-                "the original Excel (.xlsx) file instead."
+                f"Couldn't read the {label} CSV file. It may use an unusual "
+                f"encoding or delimiter. Please re-export it as UTF-8 CSV, "
+                f"or upload the original Excel (.xlsx) file instead."
             )
             st.exception(last_error)
-            st.stop()
+            return None
+        return df_local
     else:
         try:
-            df = pd.read_excel(uploaded_file)
+            file.seek(0)
+            return pd.read_excel(file)
         except Exception as e:
-            st.error("Couldn't read this Excel file. Please check the file and try again.")
+            st.error(f"Couldn't read the {label} Excel file. Please check the file and try again.")
             st.exception(e)
-            st.stop()
+            return None
+
+
+# ============================================================
+# Helper: locate a column by name, falling back to an Excel column letter
+# ============================================================
+
+def _col_letter_to_index(letter):
+    """Convert an Excel column letter (e.g. 'AL') to a zero-based index."""
+    letter = letter.strip().upper()
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def find_column(df, preferred_name, fallback_letter):
+    """
+    Finds a column by (case/whitespace-insensitive) name match first;
+    if not found, falls back to the column at the given Excel letter
+    position. Returns the actual column label, or None if unavailable.
+    """
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    key = preferred_name.strip().lower()
+    if key in normalized:
+        return normalized[key]
+
+    idx = _col_letter_to_index(fallback_letter)
+    if 0 <= idx < len(df.columns):
+        return df.columns[idx]
+
+    return None
+
+
+# ============================================================
+# Build login counts (FH / SH) per CL Name from the credit report,
+# restricted to the CRM report's own date. The actual processing
+# happens below, once we know which day the CRM export covers.
+# ============================================================
+
+login_lookup = {}
+credit_warning = None
+
+
+def build_login_lookup(credit_file, target_date):
+    """
+    Reads the credit report, keeps only rows whose 'Submitted to TCM
+    Date Time' falls on target_date (today, IST), and returns
+    (login_lookup, warning). login_lookup maps a normalized CL Name
+    -> {"FH": n, "SH": n}.
+    """
+    lookup = {}
+    warning = None
+
+    credit_df = read_uploaded_table(credit_file, "credit report")
+    if credit_df is None:
+        return lookup, warning
+
+    credit_df.columns = [str(c).strip() for c in credit_df.columns]
+
+    submitted_col = find_column(credit_df, "Submitted to TCM Date Time", "AL")
+    name_col = find_column(credit_df, "CL Name", "BE")
+
+    if submitted_col is None or name_col is None:
+        warning = (
+            "Couldn't locate the login timestamp and/or CL Name columns "
+            "in the credit report (expected 'Submitted to TCM Date Time' "
+            "around column AL, and 'CL Name' around column BE). Login "
+            "counts will show as 0."
+        )
+        return lookup, warning
+
+    credit_df[submitted_col] = normalize_to_ist(credit_df[submitted_col])
+    credit_df = credit_df.dropna(subset=[submitted_col])
+
+    # Keep only logins submitted on the same day as the CRM report
+    credit_df = credit_df[credit_df[submitted_col].dt.date == target_date]
+
+    if credit_df.empty:
+        warning = (
+            f"No rows in the credit report matched today's date "
+            f"({target_date.strftime('%d-%b-%Y')}). Login counts will show as 0. "
+            f"Double-check the credit report includes today's logins."
+        )
+        return lookup, warning
+
+    credit_df["_Session"] = credit_df[submitted_col].dt.hour.apply(
+        lambda x: "FH" if x < 14 else "SH"
+    )
+    credit_df["_NameKey"] = (
+        credit_df[name_col].astype(str).str.strip().str.lower()
+    )
+
+    counts = (
+        credit_df.groupby(["_NameKey", "_Session"])
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    for name_key, row in counts.iterrows():
+        lookup[name_key] = {
+            "FH": int(row.get("FH", 0)),
+            "SH": int(row.get("SH", 0)),
+        }
+
+    return lookup, warning
+
+
+if uploaded_file:
+
+    df = read_uploaded_table(uploaded_file, "CRM")
+    if df is None:
+        st.stop()
 
     # Normalize column names (strips stray whitespace/BOM artifacts that
     # sometimes survive in CSV headers)
@@ -387,12 +520,24 @@ if uploaded_file:
     # Remove blank dates
     df = df.dropna(subset=["LoginDate"])
 
+    # Only count logins from the credit report that fall on TODAY's date
+    # (IST) — not whichever date happens to dominate the CRM file.
+    target_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
+
+    if credit_file is not None:
+        login_lookup, credit_warning = build_login_lookup(credit_file, target_date)
+        st.caption(f"Login counts are restricted to today's date: {target_date.strftime('%d-%b-%Y')}")
+
+    if credit_warning:
+        st.warning(credit_warning)
+
     # FH before 2 PM
     df["Session"] = df["LoginDate"].dt.hour.apply(
         lambda x: "FH" if x < 14 else "SH"
     )
 
     summary = []
+    matched_login_keys = set()
 
     group_cols = [
         "Territory",
@@ -459,6 +604,17 @@ if uploaded_file:
 
         total = fh_visits + sh_visits
 
+        # ---------------- Logins (from credit report) ----------------
+
+        name_key = str(emp).strip().lower()
+        login_counts = login_lookup.get(name_key, {"FH": 0, "SH": 0})
+        if name_key in login_lookup:
+            matched_login_keys.add(name_key)
+
+        fh_logins = login_counts["FH"]
+        sh_logins = login_counts["SH"]
+        total_logins = fh_logins + sh_logins
+
         if fh_status == "Met" and sh_status == "Met":
             compliance = "Fully Compliant"
         elif fh_status == "Met" or sh_status == "Met":
@@ -508,6 +664,7 @@ if uploaded_file:
             fh_last,
             fh_duration,
             fh_status,
+            fh_logins,
             sh_locations,
             sh_visits,
             sh_first,
@@ -515,6 +672,7 @@ if uploaded_file:
             sh_duration,
             sh_status,
             total,
+            total_logins,
             compliance,
             remarks
         ])
@@ -529,6 +687,7 @@ if uploaded_file:
         "FH Last Visit",
         "FH Duration",
         "FH Status",
+        "Logins",
         "SH Locations Visited",
         "SH Visits",
         "SH First Visit",
@@ -536,6 +695,7 @@ if uploaded_file:
         "SH Duration",
         "SH Status",
         "Total Visits (Day)",
+        "Total Logins",
         "Overall Compliance",
         "Remarks"
     ]
@@ -556,6 +716,17 @@ if uploaded_file:
             summary_df[col],
             errors="coerce"
         ).dt.strftime("%H:%M").fillna("")
+
+    # Let the user know if some credit-report logins couldn't be matched
+    # to a CM in the CRM file (name mismatches, extra people, etc.)
+    if credit_file is not None and login_lookup:
+        unmatched = set(login_lookup.keys()) - matched_login_keys
+        if unmatched:
+            st.info(
+                f"{len(unmatched)} name(s) in the credit report didn't match "
+                f"any CM in the CRM file, so their logins aren't reflected "
+                f"in the summary below."
+            )
 
     # ============================================================
     # KPI strip
