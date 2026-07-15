@@ -278,7 +278,7 @@ if not uploaded_file:
         <p style="color:var(--muted); margin:0;">
         Drop today's CRM export above to generate the compliance summary.
         Field-half (FH) visits before 2 PM need at least 2 hours in-field;
-        second-half (SH) visits need at least 3 hours. The credit report is
+        second-half (SH) visits need at least 2 hours. The credit report is
         optional — upload it too if you want login counts included.
         </p>
     </div>
@@ -593,7 +593,7 @@ if uploaded_file:
             )
 
             sh_duration = f"{sh_minutes//60}:{sh_minutes%60:02d}"
-            sh_status = "Met" if sh_minutes >= 180 else "Not Met"
+            sh_status = "Met" if sh_minutes >= 120 else "Not Met"
         else:
             sh_first = pd.NaT
             sh_last = pd.NaT
